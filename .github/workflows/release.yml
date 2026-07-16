@@ -1,0 +1,362 @@
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        type: string
+        default: "3.12"
+        description: >-
+          Single version for bump/audit, and for the build unless matrix-build is on.
+          A pure-Python wheel is py3-none-any, so one build covers every version.
+      python-versions:
+        type: string
+        default: '["3.12", "3.13"]'
+        description: JSON array forwarded to the QA matrix (and to the build if matrix-build).
+      matrix-build:
+        type: boolean
+        default: false
+        description: >-
+          Build a wheel per version in python-versions (needed for compiled/Cython
+          extensions, whose wheels are version-specific). Keep false for pure Python —
+          a matrix build would produce colliding identical py3-none-any wheels.
+          When true, python-version must be one of python-versions (the sdist builds on
+          that leg) — the validate job checks this up front and fails red otherwise.
+      working-directory:
+        type: string
+        default: "."
+      setup-script:
+        type: string
+        default: ""
+        description: >-
+          Shell run after `poetry install`, before checks (in QA) and before the build
+          (compiled extensions need e.g. build_ext here too). See test.yml.
+      post-run-script:
+        type: string
+        default: ""
+        description: Teardown shell run after the QA checks, always. See test.yml.
+      pypi-package-name:
+        type: string
+        required: true
+      stable-branch:
+        type: string
+        default: "main"
+        description: The protected release branch (e.g. main or master).
+      dev-branch:
+        type: string
+        default: "develop"
+        description: The integration branch releases are cut from.
+      docs-url:
+        type: string
+        default: ""
+        description: >-
+          Base URL of the project's published docs site (e.g. https://stark.markparker.me).
+          When set, the release changelog gains "New Documentation" / "Updated Documentation"
+          sections linking changed docs/**.md pages. Leave empty to skip (commits-only).
+
+jobs:
+  # Fail fast on bad config before the QA matrix / audit spend any time.
+  validate:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: matrix-build requires python-version in python-versions
+        if: ${{ inputs.matrix-build }}
+        env:
+          PYTHON_VERSION: ${{ inputs.python-version }}
+          PYTHON_VERSIONS: ${{ inputs.python-versions }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys
+          versions = json.loads(os.environ["PYTHON_VERSIONS"])
+          pv = os.environ["PYTHON_VERSION"]
+          if pv not in versions:
+              print(f"::error::matrix-build is true but python-version ({pv!r}) is not in "
+                    f"python-versions ({versions}) — it must be, since that leg builds the sdist.")
+              sys.exit(1)
+          print(f"OK: python-version {pv!r} is in {versions}")
+          EOF
+
+  qa:
+    name: QA & Tests
+    needs: validate
+    uses: ParkerIndustries/workflows/.github/workflows/test.yml@v1
+    with:
+      python-versions: ${{ inputs.python-versions }}
+      working-directory: ${{ inputs.working-directory }}
+      setup-script: ${{ inputs.setup-script }}
+      post-run-script: ${{ inputs.post-run-script }}
+
+  # Release-only gate: a vulnerable dependency blocks the release, but does NOT gate
+  # everyday PRs/pushes (pip-audit is deliberately not part of `poe check`). Self-installs
+  # pip-audit so consumers don't have to declare it.
+  audit:
+    name: Dependency audit
+    needs: validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install poetry
+        run: pipx install poetry
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: poetry
+      - name: Install dependencies
+        run: poetry install
+      - name: pip-audit
+        run: |
+          poetry run python -m pip install -q pip-audit
+          poetry run pip-audit
+
+  bump:
+    name: Version bump & changelog
+    needs: [qa, audit]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+    permissions:
+      contents: write
+    env:
+      DEV_BRANCH: ${{ inputs.dev-branch }}
+      STABLE_BRANCH: ${{ inputs.stable-branch }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.dev-branch }}
+
+      - name: Configure git
+        run: |
+          git config user.email "bot@parker-programs.com"
+          git config user.name "Parker Industries Bot"
+
+      - name: Merge stable branch into dev branch
+        run: |
+          git fetch origin "$STABLE_BRANCH"
+          git merge "origin/$STABLE_BRANCH" --no-edit --strategy-option=ours
+
+      - name: Install poetry
+        run: pipx install poetry
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: poetry
+
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Bump patch version
+        id: bump
+        run: |
+          poetry version patch
+          VERSION=$(poetry version --short)
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          git add pyproject.toml
+          git commit -m "chore: bump version to ${TAG}"
+          git push origin "$DEV_BRANCH"
+
+      - name: Generate changelog
+        id: changelog
+        env:
+          DOCS_URL: ${{ inputs.docs-url }}
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            # No prior release: commits = all history, docs diff = from the root commit.
+            RANGE=""
+            DIFF_BASE=$(git rev-list --max-parents=0 HEAD | tail -1)
+          else
+            RANGE="${LAST_TAG}..HEAD"
+            DIFF_BASE="$LAST_TAG"
+          fi
+
+          COMMITS=$(git log --pretty=format:"- %s" ${RANGE})
+
+          # docs/**.md -> hosted-site links, matching STARK's release-notes style.
+          # Only emitted when docs-url is provided (repos without published docs skip this).
+          # sed (portable POSIX BRE): strip docs/ prefix + .md suffix, then map index pages
+          #   to their directory root so mkdocs' use_directory_urls links resolve
+          #   (foo/index -> foo, top-level index -> "" i.e. the site root).
+          docs_links() {
+            git diff --diff-filter="$1" --name-only "${DIFF_BASE}..HEAD" -- 'docs/*.md' 'docs/**/*.md' \
+              | sed -e 's|^docs/||' -e 's|\.md$||' -e 's|/index$||' -e 's|^index$||' \
+              | while read -r p; do echo "- [${p:-home}](${DOCS_URL%/}/${p})"; done
+          }
+
+          NEW_DOCS=""
+          CHANGED_DOCS=""
+          if [ -n "$DOCS_URL" ]; then
+            NEW_DOCS=$(docs_links A)
+            CHANGED_DOCS=$(docs_links M)
+          fi
+
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "changelog<<${EOF}" >> $GITHUB_OUTPUT
+          {
+            if [ -n "$NEW_DOCS" ]; then
+              echo "## New Documentation"
+              echo "$NEW_DOCS"
+              echo ""
+            fi
+            if [ -n "$CHANGED_DOCS" ]; then
+              echo "## Updated Documentation"
+              echo "$CHANGED_DOCS"
+              echo ""
+            fi
+            echo "## Changes"
+            echo "$COMMITS"
+          } >> $GITHUB_OUTPUT
+          echo "${EOF}" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build (py${{ matrix.python-version }})
+    needs: bump
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # matrix-build on -> one leg per python-versions (compiled wheels are version-specific).
+      # off -> a single leg at python-version (pure-Python py3-none-any covers all versions).
+      matrix:
+        python-version: ${{ fromJSON(inputs.matrix-build && inputs.python-versions || format('["{0}"]', inputs.python-version)) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.dev-branch }} # the just-bumped commit
+
+      - name: Install poetry
+        run: pipx install poetry
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: poetry
+
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Setup
+        if: inputs.setup-script != ''
+        run: ${{ inputs.setup-script }}
+
+      - name: Build wheel
+        run: poetry build -f wheel
+
+      # Build the sdist exactly once (on the primary version), regardless of matrix size.
+      - name: Build sdist
+        if: matrix.python-version == inputs.python-version
+        run: poetry build -f sdist
+
+      - name: Store distribution packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.python-version }}
+          path: ${{ inputs.working-directory }}/dist/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: https://pypi.org/p/${{ inputs.pypi-package-name }}
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  merge-and-tag:
+    name: Merge dev → stable & tag
+    needs:
+      - bump
+      - publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      DEV_BRANCH: ${{ inputs.dev-branch }}
+      STABLE_BRANCH: ${{ inputs.stable-branch }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.stable-branch }}
+
+      - name: Configure git
+        run: |
+          git config user.email "bot@parker-programs.com"
+          git config user.name "Parker Industries Bot"
+
+      - name: Merge dev branch into stable branch
+        run: |
+          git fetch origin "$DEV_BRANCH"
+          git merge "origin/$DEV_BRANCH" --ff-only
+          git push origin "$STABLE_BRANCH"
+
+      - name: Create version tag
+        run: |
+          TAG="${{ needs.bump.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+  github-release:
+    name: GitHub Release
+    needs:
+      - bump
+      - merge-and-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Sign distributions with Sigstore
+        uses: sigstore/gh-action-sigstore-python@v3.0.1
+        with:
+          inputs: >-
+            ./dist/*.tar.gz
+            ./dist/*.whl
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.bump.outputs.tag }}
+          name: Release ${{ needs.bump.outputs.tag }}
+          body: ${{ needs.bump.outputs.changelog }}
+          files: dist/**
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: false

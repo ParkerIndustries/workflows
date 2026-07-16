@@ -1,0 +1,76 @@
+name: QA & Tests
+
+on:
+  workflow_call:
+    inputs:
+      python-versions:
+        type: string
+        # JSON array — our team's standard matrix. Bumping this here migrates every
+        # consuming repo in sync on their next run. Callers can override with their own
+        # JSON list (e.g. a 3rd-party lib supporting a different range).
+        default: '["3.12", "3.13"]'
+      working-directory:
+        type: string
+        default: "."
+      setup-script:
+        type: string
+        default: ""
+        description: >-
+          Shell run on the runner AFTER `poetry install`, BEFORE `poe check` (once per
+          matrix leg). For runtime system packages (apt), Cython `build_ext --inplace`,
+          starting service containers (docker compose up), etc. Runs in working-directory.
+      post-run-script:
+        type: string
+        default: ""
+        description: >-
+          Shell run AFTER `poe check`, ALWAYS (even if checks failed) — for teardown /
+          cleanup, e.g. `docker compose down`. Its own failure also fails the job.
+
+jobs:
+  qa:
+    name: py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install poetry
+        run: pipx install poetry
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: poetry
+
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Setup
+        if: inputs.setup-script != ''
+        run: ${{ inputs.setup-script }}
+
+      - name: Run checks
+        run: poetry run poe check --ci
+
+      - name: Post-run
+        if: always() && inputs.post-run-script != ''
+        run: ${{ inputs.post-run-script }}
+
+  # Single, stable status for branch protection to require — one name regardless of how
+  # many versions the matrix has, so the required check doesn't change when the matrix does.
+  check:
+    name: check
+    needs: qa
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify the QA matrix passed
+        run: |
+          [ "${{ needs.qa.result }}" = "success" ] || { echo "QA matrix did not pass"; exit 1; }

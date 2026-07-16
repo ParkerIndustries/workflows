@@ -1,0 +1,42 @@
+name: Dependabot Auto-merge
+
+on:
+  workflow_call:
+
+jobs:
+  # Reactive: enable auto-merge on the single PR that triggered the pull_request event.
+  automerge-new:
+    if: github.actor == 'dependabot[bot]' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+
+    steps:
+      - name: Auto merge dependency update
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+
+  # Manual backfill: enable auto-merge on every currently-open Dependabot PR against develop.
+  automerge-all-open:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+
+    steps:
+      - name: Enable auto merge on all open Dependabot PRs
+        run: |
+          gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --author "dependabot[bot]" \
+            --base develop \
+            --state open \
+            --json url \
+            --jq '.[].url' \
+          | xargs -I {} gh pr merge --auto --squash {}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
