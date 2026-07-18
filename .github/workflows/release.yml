@@ -77,15 +77,38 @@ jobs:
           print(f"OK: python-version {pv!r} is in {versions}")
           EOF
 
+  # QA is INLINED (not a `uses: test.yml` reusable call) on purpose: PyPI Trusted Publishing
+  # rejects a run whose token comes through a reusable workflow that itself calls another reusable
+  # workflow, when the top caller is in a different org (nested cross-org reusable → startup_failure).
+  # Mirrors test.yml's steps.
   qa:
-    name: QA & Tests
+    name: QA & Tests (py${{ matrix.python-version }})
     needs: validate
-    uses: ParkerIndustries/workflows/.github/workflows/test.yml@v1
-    with:
-      python-versions: ${{ inputs.python-versions }}
-      working-directory: ${{ inputs.working-directory }}
-      setup-script: ${{ inputs.setup-script }}
-      post-run-script: ${{ inputs.post-run-script }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install poetry
+        run: pipx install poetry
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: poetry
+      - name: Install dependencies
+        run: poetry install
+      - name: Setup
+        if: inputs.setup-script != ''
+        run: ${{ inputs.setup-script }}
+      - name: Run checks
+        run: poetry run poe check --ci
+      - name: Post-run
+        if: always() && inputs.post-run-script != ''
+        run: ${{ inputs.post-run-script }}
 
   # Release-only gate: a vulnerable dependency blocks the release, but does NOT gate
   # everyday PRs/pushes (pip-audit is deliberately not part of `poe check`). Self-installs
