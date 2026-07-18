@@ -132,7 +132,9 @@ jobs:
         run: poetry install
       - name: pip-audit
         run: |
-          poetry run python -m pip install -q pip-audit
+          # cachecontrol >=0.14 is needed for urllib3 2.x (older combos crash with
+          # "'HTTPResponse' object has no attribute 'strict'" auditing projects on urllib3 2).
+          poetry run python -m pip install -q pip-audit 'cachecontrol>=0.14'
           poetry run pip-audit
 
   bump:
