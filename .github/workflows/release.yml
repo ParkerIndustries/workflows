@@ -269,32 +269,17 @@ jobs:
           name: dist-${{ matrix.python-version }}
           path: ${{ inputs.working-directory }}/dist/
 
-  publish-pypi:
-    name: Publish to PyPI
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: release
-      url: https://pypi.org/p/${{ inputs.pypi-package-name }}
-    permissions:
-      id-token: write
-
-    steps:
-      - name: Download distributions
-        uses: actions/download-artifact@v4
-        with:
-          pattern: dist-*
-          merge-multiple: true
-          path: dist/
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+  # NOTE: PyPI publishing is intentionally NOT done here. PyPI Trusted Publishing does not
+  # support publishing from a reusable workflow (the OIDC token's job_workflow_ref points at
+  # this repo, which PyPI won't match). Each caller runs pypa/gh-action-pypi-publish in its OWN
+  # release.yml, after this workflow, downloading the `dist-*` artifact built below. See the
+  # template's release.yml for the publish job to copy.
 
   merge-and-tag:
     name: Merge dev → stable & tag
     needs:
       - bump
-      - publish-pypi
+      - build
     runs-on: ubuntu-latest
     permissions:
       contents: write
