@@ -25,6 +25,12 @@ on:
       working-directory:
         type: string
         default: "."
+      audit-args:
+        type: string
+        default: ""
+        description: >-
+          Extra args appended to `pip-audit` in the release audit — e.g.
+          `--ignore-vuln PYSEC-2026-1325` for an unfixable transitive advisory. Use sparingly.
       setup-script:
         type: string
         default: ""
@@ -135,7 +141,7 @@ jobs:
           # cachecontrol >=0.14 is needed for urllib3 2.x (older combos crash with
           # "'HTTPResponse' object has no attribute 'strict'" auditing projects on urllib3 2).
           poetry run python -m pip install -q pip-audit 'cachecontrol>=0.14'
-          poetry run pip-audit
+          poetry run pip-audit ${{ inputs.audit-args }}
 
   bump:
     name: Version bump & changelog
