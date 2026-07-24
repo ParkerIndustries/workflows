@@ -40,3 +40,40 @@ jobs:
           | xargs -I {} gh pr merge --auto --squash {}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Self-healing: when the base branch moves (a push) or on demand/schedule, ask Dependabot to
+  # recreate any PR that has become CONFLICTING. Dependabot rebuilds the branch against the current
+  # base and regenerates pyproject.toml / poetry.lock from scratch — a clean, native resolution that
+  # also re-runs CI (which a GITHUB_TOKEN push would not). This is what stops the recurring
+  # pyproject/lock conflicts when several dependency updates and manual bumps race on develop.
+  recreate-conflicted:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Recreate conflicted Dependabot PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          prs=$(gh pr list --repo "$REPO" --author "dependabot[bot]" --state open --json number --jq '.[].number')
+          [ -z "$prs" ] && { echo "No open Dependabot PRs."; exit 0; }
+          for pr in $prs; do
+            # GitHub computes mergeability asynchronously; poll until it's known (or give up).
+            state="UNKNOWN"
+            for _ in 1 2 3 4 5 6 7 8; do
+              state=$(gh pr view "$pr" --repo "$REPO" --json mergeable --jq '.mergeable')
+              [ "$state" != "UNKNOWN" ] && break
+              sleep 5
+            done
+            if [ "$state" = "CONFLICTING" ]; then
+              echo "PR #$pr is CONFLICTING — asking Dependabot to recreate it."
+              gh pr comment "$pr" --repo "$REPO" --body "@dependabot recreate"
+            else
+              echo "PR #$pr: $state (no action)."
+            fi
+          done
