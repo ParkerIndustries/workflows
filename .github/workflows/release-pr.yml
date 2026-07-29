@@ -1,0 +1,54 @@
+name: Release PR
+
+# Reusable: keep one open "release" PR from dev-branch -> stable-branch, for repos whose
+# release IS "push to stable" (e.g. markparker.me deploys to GitHub Pages on master push).
+# Merging the PR = shipping. Creates it when dev is ahead and none is open; otherwise just
+# refreshes the changelog in its body (GitHub keeps the diff itself current). Closes nothing
+# — merging is the owner's one click. Uses the compare API, so no checkout needed.
+on:
+  workflow_call:
+    inputs:
+      stable-branch:
+        type: string
+        default: master
+      dev-branch:
+        type: string
+        default: develop
+      mention:
+        type: string
+        default: ""
+        description: Handle to @-mention in the PR body (e.g. "@MarkParker5"). Empty to skip.
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Open or refresh the release PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          STABLE: ${{ inputs.stable-branch }}
+          DEV: ${{ inputs.dev-branch }}
+          MENTION: ${{ inputs.mention }}
+        run: |
+          set -euo pipefail
+          cmp=$(gh api "repos/${REPO}/compare/${STABLE}...${DEV}")
+          ahead=$(echo "$cmp" | jq -r '.ahead_by')
+          if [ "$ahead" = "0" ]; then
+            echo "'${DEV}' is not ahead of '${STABLE}' — nothing to release."
+            exit 0
+          fi
+          changelog=$(echo "$cmp" | jq -r '.commits[].commit.message | split("\n")[0] | "- " + .')
+          body=$(printf '%s%s commit(s) ready to release (`%s` -> `%s`). Merging this PR ships them.\n\n## Changes\n%s\n' \
+                 "${MENTION:+${MENTION} - }" "$ahead" "$DEV" "$STABLE" "$changelog")
+          num=$(gh pr list --repo "$REPO" --base "$STABLE" --head "$DEV" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$num" ]; then
+            gh pr create --repo "$REPO" --base "$STABLE" --head "$DEV" \
+              --title "Release: ${DEV} -> ${STABLE}" --body "$body"
+          else
+            gh pr edit "$num" --repo "$REPO" --body "$body"
+            echo "Refreshed release PR #$num"
+          fi

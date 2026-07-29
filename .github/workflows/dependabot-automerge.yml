@@ -2,6 +2,15 @@ name: Dependabot Auto-merge
 
 on:
   workflow_call:
+    inputs:
+      skip-major:
+        type: boolean
+        default: false
+        description: >-
+          When true, do NOT auto-merge major (semver-major) version bumps — Dependabot
+          still opens the PR for manual review; patch/minor (and security) auto-merge as
+          usual. Default false preserves the original "auto-merge every Dependabot PR"
+          behavior for existing consumers, so this is a non-breaking opt-in.
 
 jobs:
   # Reactive: enable auto-merge on the single PR that triggered the pull_request event.
@@ -13,7 +22,15 @@ jobs:
       contents: write
 
     steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
       - name: Auto merge dependency update
+        # With skip-major on, a major bump is left for a human (the PR still exists);
+        # anything non-major auto-merges. With skip-major off, everything auto-merges.
+        if: >-
+          !inputs.skip-major ||
+          steps.meta.outputs.update-type != 'version-update:semver-major'
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

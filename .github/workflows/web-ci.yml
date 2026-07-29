@@ -1,0 +1,74 @@
+name: Web CI
+
+# Reusable CI for the org's Node/Next.js repos (markparker.me, ParkerIndustries-Web).
+# The Python `test.yml` in this repo doesn't fit them — this is the npm equivalent:
+# install, typecheck, optional lint, build. Callers point their develop-push and PR
+# events at it. Mirrors test.yml's "single stable `check` status for branch
+# protection" idea so the required check name never changes with the steps.
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "lts/*"
+      working-directory:
+        type: string
+        default: "."
+      typecheck:
+        type: boolean
+        default: true
+        description: Run `npx tsc --noEmit` before building.
+      lint-command:
+        type: string
+        default: ""
+        description: >-
+          Lint command to run, or empty to skip. NOTE: pass a non-mutating check
+          (e.g. `next lint`), not an auto-fixing one (`eslint --fix`), which would
+          "pass" by rewriting files CI then throws away.
+      build-command:
+        type: string
+        default: "npm run build"
+      env-json:
+        type: string
+        default: "{}"
+        description: JSON object of env vars to expose to the build (e.g. a dummy HOST).
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+      - name: Install dependencies
+        # npm ci when a lockfile is present (fast, reproducible), else fall back.
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      - name: Typecheck
+        if: inputs.typecheck
+        run: npx tsc --noEmit
+      - name: Lint
+        if: inputs.lint-command != ''
+        run: ${{ inputs.lint-command }}
+      - name: Build
+        run: ${{ inputs.build-command }}
+        env:
+          # Materialize the JSON env object into real env vars for the build step.
+          ENV_JSON: ${{ inputs.env-json }}
+
+  # One stable status for branch protection to require, independent of the steps above.
+  check:
+    name: check
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify build passed
+        run: '[ "${{ needs.build.result }}" = "success" ] || { echo "Web CI failed"; exit 1; }'

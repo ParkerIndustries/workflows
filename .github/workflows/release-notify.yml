@@ -1,0 +1,67 @@
+name: Release notify (issue)
+
+# Reusable: for repos whose release ISN'T a plain push to stable (e.g. ParkerIndustries-Web
+# deploys to Vercel via a manual production dispatch), a develop->master PR wouldn't ship
+# anything by itself. Instead this opens/refreshes a single "bot: pending release" issue with
+# the changelog and an @mention, as a nudge to run the deploy. Closes the issue once develop
+# is no longer ahead. Uses the compare API — no checkout.
+on:
+  workflow_call:
+    inputs:
+      stable-branch:
+        type: string
+        default: master
+      dev-branch:
+        type: string
+        default: develop
+      mention:
+        type: string
+        default: ""
+      deploy-hint:
+        type: string
+        default: ""
+        description: One line telling the owner how to actually ship (e.g. which workflow to dispatch).
+      label:
+        type: string
+        default: pending-release
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open, refresh, or close the pending-release issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          STABLE: ${{ inputs.stable-branch }}
+          DEV: ${{ inputs.dev-branch }}
+          MENTION: ${{ inputs.mention }}
+          HINT: ${{ inputs.deploy-hint }}
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -euo pipefail
+          TITLE="bot: pending release"
+          cmp=$(gh api "repos/${REPO}/compare/${STABLE}...${DEV}")
+          ahead=$(echo "$cmp" | jq -r '.ahead_by')
+          num=$(gh issue list --repo "$REPO" --state open --search "in:title \"${TITLE}\"" \
+                  --json number,title --jq 'map(select(.title=="'"${TITLE}"'"))[0].number // empty')
+          if [ "$ahead" = "0" ]; then
+            if [ -n "$num" ]; then
+              gh issue close "$num" --repo "$REPO" --comment "Released — \`${DEV}\` is no longer ahead of \`${STABLE}\`."
+            fi
+            echo "Nothing pending."
+            exit 0
+          fi
+          changelog=$(echo "$cmp" | jq -r '.commits[].commit.message | split("\n")[0] | "- " + .')
+          body=$(printf '%s%s commit(s) on `%s` are ready to release to `%s`.\n\n%s\n\n## Changes\n%s\n' \
+                 "${MENTION:+${MENTION} - }" "$ahead" "$DEV" "$STABLE" "${HINT}" "$changelog")
+          if [ -z "$num" ]; then
+            gh label create "$LABEL" --repo "$REPO" --color BFD4F2 --description "Bot: develop has unreleased commits" --force >/dev/null 2>&1 || true
+            gh issue create --repo "$REPO" --title "$TITLE" --body "$body" --label "$LABEL"
+          else
+            gh issue edit "$num" --repo "$REPO" --body "$body"
+            echo "Refreshed pending-release issue #$num"
+          fi
