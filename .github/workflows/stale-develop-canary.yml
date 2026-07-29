@@ -1,0 +1,93 @@
+name: Stale develop canary
+
+# Reusable: a monthly escalation on top of the always-on release nudges (release-pr /
+# release-notify). Those refresh on every develop movement and are easy to tune out; this
+# fires only when the OLDEST unreleased commit has sat on dev-branch longer than stale-days,
+# i.e. a release has genuinely been forgotten. Opens/refreshes one "bot: stale develop"
+# issue with how long it's been waiting + the changelog, and closes it once dev is no longer
+# ahead. Compare API only — no checkout. Call it on a monthly schedule.
+on:
+  workflow_call:
+    inputs:
+      stable-branch:
+        type: string
+        default: master
+      dev-branch:
+        type: string
+        default: develop
+      mention:
+        type: string
+        default: ""
+        description: Handle to @-mention (e.g. "@MarkParker5"). Empty to skip.
+      stale-days:
+        type: number
+        default: 30
+        description: Only ping if the oldest unreleased commit is at least this many days old.
+      deploy-hint:
+        type: string
+        default: ""
+        description: One line telling the owner how to actually ship.
+      label:
+        type: string
+        default: stale-develop
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open, refresh, or close the stale-develop issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          STABLE: ${{ inputs.stable-branch }}
+          DEV: ${{ inputs.dev-branch }}
+          MENTION: ${{ inputs.mention }}
+          STALE_DAYS: ${{ inputs.stale-days }}
+          HINT: ${{ inputs.deploy-hint }}
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -euo pipefail
+          TITLE="bot: stale develop"
+          cmp=$(gh api "repos/${REPO}/compare/${STABLE}...${DEV}")
+          ahead=$(echo "$cmp" | jq -r '.ahead_by')
+          num=$(gh issue list --repo "$REPO" --state open --search "in:title \"${TITLE}\"" \
+                  --json number,title --jq 'map(select(.title=="'"${TITLE}"'"))[0].number // empty')
+
+          # Not ahead -> released; close any open canary and stop.
+          if [ "$ahead" = "0" ]; then
+            if [ -n "$num" ]; then
+              gh issue close "$num" --repo "$REPO" --comment "Released — \`${DEV}\` is no longer ahead of \`${STABLE}\`."
+            fi
+            echo "Nothing pending."
+            exit 0
+          fi
+
+          # Age of the OLDEST unreleased commit (first in the compare list).
+          oldest=$(echo "$cmp" | jq -r '.commits[0].commit.committer.date')
+          oldest_epoch=$(date -u -d "$oldest" +%s)
+          now_epoch=$(date -u +%s)
+          age_days=$(( (now_epoch - oldest_epoch) / 86400 ))
+          echo "develop is $ahead commit(s) ahead; oldest is $age_days day(s) old (threshold ${STALE_DAYS})."
+
+          # Fresh enough -> don't nag; close a lingering canary if the backlog aged back down.
+          if [ "$age_days" -lt "$STALE_DAYS" ]; then
+            if [ -n "$num" ]; then
+              gh issue close "$num" --repo "$REPO" --comment "No longer stale — oldest unreleased commit is now ${age_days} day(s) old."
+            fi
+            echo "Below staleness threshold — no ping."
+            exit 0
+          fi
+
+          changelog=$(echo "$cmp" | jq -r '.commits[].commit.message | split("\n")[0] | "- " + .')
+          body=$(printf '%s`%s` has been ahead of `%s` for **%s days** (%s unreleased commit(s)). Time to ship or explicitly defer.\n\n%s\n\n## Unreleased changes\n%s\n' \
+                 "${MENTION:+${MENTION} - }" "$DEV" "$STABLE" "$age_days" "$ahead" "${HINT}" "$changelog")
+          if [ -z "$num" ]; then
+            gh label create "$LABEL" --repo "$REPO" --color FBCA04 --description "Bot: develop has unreleased commits older than the staleness threshold" --force >/dev/null 2>&1 || true
+            gh issue create --repo "$REPO" --title "$TITLE" --body "$body" --label "$LABEL"
+          else
+            gh issue edit "$num" --repo "$REPO" --body "$body"
+            echo "Refreshed stale-develop issue #$num"
+          fi
