@@ -28,6 +28,14 @@ on:
       build-command:
         type: string
         default: "npm run build"
+      setup-command:
+        type: string
+        default: ""
+        description: >-
+          Command run after install, BEFORE typecheck/build — for code generation a
+          typecheck depends on (e.g. markparker.me generates src/data/notes.json via
+          `npm run generate:notes`, without which tsc can't resolve it). `npm run build`
+          runs it too via prebuild, but the separate typecheck step runs first.
       env-json:
         type: string
         default: "{}"
@@ -51,6 +59,9 @@ jobs:
         # npm ci when a lockfile is present (fast, reproducible), else fall back.
         run: |
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      - name: Setup / codegen
+        if: inputs.setup-command != ''
+        run: ${{ inputs.setup-command }}
       - name: Typecheck
         if: inputs.typecheck
         run: npx tsc --noEmit
