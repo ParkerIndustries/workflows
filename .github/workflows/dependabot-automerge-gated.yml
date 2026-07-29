@@ -1,0 +1,77 @@
+name: Dependabot Auto-merge (gated)
+
+# For repos that CAN'T use branch protection (private repo on a free plan, e.g.
+# ParkerIndustries-Web) — so `gh pr merge --auto` has nothing to gate on. This gates the
+# merge itself: on a Dependabot PR, wait for the NAMED required checks to conclude, and
+# squash-merge only if they ALL succeed. Skips majors (opt-in). Deliberately watches
+# specific check names, not the whole CI workflow's conclusion — e.g. PI's preview
+# workflow also runs a Vercel deploy job that fails on its own (secrets), which must not
+# block a merge that the build+lint checks passed.
+on:
+  workflow_call:
+    inputs:
+      skip-major:
+        type: boolean
+        default: true
+      required-checks:
+        type: string
+        required: true
+        description: Comma-separated check-run names that must all succeed (e.g. "Check / Run build, Check / Run linter").
+      wait-minutes:
+        type: number
+        default: 25
+        description: How long to wait for the required checks to conclude before giving up.
+
+jobs:
+  gated-merge:
+    if: github.actor == 'dependabot[bot]' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+
+      - name: Wait for required checks, then merge if green
+        if: ${{ !(inputs.skip-major && steps.meta.outputs.update-type == 'version-update:semver-major') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          REQUIRED: ${{ inputs.required-checks }}
+          WAIT_MIN: ${{ inputs.wait-minutes }}
+        run: |
+          set -euo pipefail
+          # Parse the comma-separated required check names (trim whitespace, drop blanks).
+          mapfile -t REQ < <(echo "$REQUIRED" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
+          echo "Gating merge of PR #$PR on: ${REQ[*]}"
+          deadline=$(( SECONDS + WAIT_MIN * 60 ))
+          while :; do
+            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+                     --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv')
+            all_done=true
+            for name in "${REQ[@]}"; do
+              line=$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1==n {print; exit}')
+              if [ -z "$line" ]; then all_done=false; continue; fi   # check hasn't registered yet
+              status=$(printf '%s' "$line" | cut -f2)
+              conclusion=$(printf '%s' "$line" | cut -f3)
+              if [ "$status" = "completed" ] && [ "$conclusion" != "success" ]; then
+                echo "Required check '$name' concluded '$conclusion' — NOT merging."
+                exit 0
+              fi
+              [ "$status" != "completed" ] && all_done=false
+            done
+            if [ "$all_done" = true ]; then
+              echo "All required checks passed — merging."
+              gh pr merge "$PR" --repo "$REPO" --squash
+              exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Timed out waiting for required checks — leaving PR open."
+              exit 0
+            fi
+            sleep 20
+          done
