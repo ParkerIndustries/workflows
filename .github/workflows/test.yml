@@ -12,19 +12,29 @@ on:
       working-directory:
         type: string
         default: "."
+      services-compose:
+        type: string
+        default: ""
+        description: >-
+          Path to a docker-compose file (relative to working-directory) whose services the
+          checks need — e.g. a Postgres for pytest. When set, the reusable runs
+          `docker compose -f <file> up -d --wait` BEFORE setup-script/checks and
+          `docker compose -f <file> down -v` AFTER, always. This is the first-class way to
+          give DB-backed repos (Cloud, Blog, …) a database in CI — cleaner than hand-rolling
+          it in setup-script. Requires healthchecks in the compose services for `--wait`.
       setup-script:
         type: string
         default: ""
         description: >-
-          Shell run on the runner AFTER `poetry install`, BEFORE `poe check` (once per
-          matrix leg). For runtime system packages (apt), Cython `build_ext --inplace`,
-          starting service containers (docker compose up), etc. Runs in working-directory.
+          Shell run on the runner AFTER `poetry install` and AFTER services are up, BEFORE
+          `poe check` (once per matrix leg). For runtime system packages (apt), Cython
+          `build_ext --inplace`, DB migrations, fixture seeding, etc. Runs in working-directory.
       post-run-script:
         type: string
         default: ""
         description: >-
           Shell run AFTER `poe check`, ALWAYS (even if checks failed) — for teardown /
-          cleanup, e.g. `docker compose down`. Its own failure also fails the job.
+          cleanup. Runs before the services are torn down. Its own failure also fails the job.
 
 jobs:
   qa:
@@ -52,6 +62,12 @@ jobs:
       - name: Install dependencies
         run: poetry install
 
+      # Bring service containers up before anything that might need them (migrations in
+      # setup-script, pytest in checks). `--wait` blocks until healthchecks pass.
+      - name: Start service containers
+        if: inputs.services-compose != ''
+        run: docker compose -f "${{ inputs.services-compose }}" up -d --wait
+
       - name: Setup
         if: inputs.setup-script != ''
         run: ${{ inputs.setup-script }}
@@ -62,6 +78,11 @@ jobs:
       - name: Post-run
         if: always() && inputs.post-run-script != ''
         run: ${{ inputs.post-run-script }}
+
+      # Always tear services down (and drop their volumes) so a rerun starts clean.
+      - name: Stop service containers
+        if: always() && inputs.services-compose != ''
+        run: docker compose -f "${{ inputs.services-compose }}" down -v
 
   # Single, stable status for branch protection to require — one name regardless of how
   # many versions the matrix has, so the required check doesn't change when the matrix does.
