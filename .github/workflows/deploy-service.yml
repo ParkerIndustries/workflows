@@ -1,0 +1,119 @@
+name: Deploy service
+
+# Rolls a pre-built GHCR image (from docker-build.yml) out to ONE environment via Dokploy,
+# then health-gates the result and rolls back + reports on failure. Reaches the Dokploy
+# control plane over Tailscale so its port never has to be public. Dev/prod only — previews
+# use preview.yml.
+#
+# Dokploy API shapes are pinned to inputs (deploy-endpoint / rollback-endpoint) so they can
+# be finalized against the running Dokploy version WITHOUT editing this reusable. Verify them
+# once Dokploy is stood up on the UK box.
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        required: true
+        type: string
+        description: Digest-pinned image from docker-build (ghcr.io/…@sha256:…).
+      application-id:
+        required: true
+        type: string
+        description: Dokploy application id for this service + environment.
+      environment:
+        required: true
+        type: string
+        description: dev | prod (labels/logs only).
+      dokploy-url:
+        required: true
+        type: string
+        description: Dokploy base URL on the tailnet, e.g. http://internal-uk.tailnet:3000
+      health-url:
+        required: true
+        type: string
+        description: URL polled until HTTP 200 after the deploy (e.g. the service /health).
+      health-timeout:
+        type: number
+        default: 180
+        description: Seconds to wait for health before declaring failure and rolling back.
+      deploy-endpoint:
+        type: string
+        default: "/api/application.deploy"
+        description: Dokploy deploy endpoint — VERIFY against your Dokploy version.
+      rollback-endpoint:
+        type: string
+        default: "/api/application.rollback"
+        description: Dokploy rollback endpoint — VERIFY against your Dokploy version.
+    secrets:
+      tailscale-oauth-client-id:
+        required: true
+      tailscale-oauth-secret:
+        required: true
+      dokploy-token:
+        required: true
+      telegram-bot-token:
+        required: false
+      telegram-chat-id:
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Never let two deploys of the same app+env interleave.
+    concurrency:
+      group: deploy-${{ inputs.application-id }}
+      cancel-in-progress: false
+    steps:
+      - name: Join tailnet (ephemeral)
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.tailscale-oauth-client-id }}
+          oauth-secret: ${{ secrets.tailscale-oauth-secret }}
+          tags: tag:ci
+
+      - name: Trigger Dokploy deploy
+        env:
+          DOKPLOY_TOKEN: ${{ secrets.dokploy-token }}
+        run: |
+          set -euo pipefail
+          echo "Deploying ${{ inputs.image }} → ${{ inputs.environment }} (app ${{ inputs.application-id }})"
+          curl -fsS -X POST "${{ inputs.dokploy-url }}${{ inputs.deploy-endpoint }}" \
+            -H "x-api-key: $DOKPLOY_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{\"applicationId\":\"${{ inputs.application-id }}\",\"image\":\"${{ inputs.image }}\"}"
+
+      - name: Health-gate
+        id: health
+        run: |
+          set -uo pipefail
+          deadline=$(( SECONDS + ${{ inputs.health-timeout }} ))
+          until curl -fsS -o /dev/null "${{ inputs.health-url }}"; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::still unhealthy after ${{ inputs.health-timeout }}s"; exit 1
+            fi
+            echo "waiting for ${{ inputs.health-url }} ..."; sleep 5
+          done
+          echo "healthy"
+
+      - name: Rollback on failure
+        if: failure()
+        env:
+          DOKPLOY_TOKEN: ${{ secrets.dokploy-token }}
+        run: |
+          echo "::error::Deploy failed — rolling back ${{ inputs.application-id }}"
+          curl -fsS -X POST "${{ inputs.dokploy-url }}${{ inputs.rollback-endpoint }}" \
+            -H "x-api-key: $DOKPLOY_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{\"applicationId\":\"${{ inputs.application-id }}\"}"
+
+      - name: Report failure to Telegram
+        if: failure()
+        continue-on-error: true
+        env:
+          TG_TOKEN: ${{ secrets.telegram-bot-token }}
+          TG_CHAT: ${{ secrets.telegram-chat-id }}
+        run: |
+          [ -n "${TG_TOKEN:-}" ] || { echo "no telegram token set — skipping notify"; exit 0; }
+          curl -fsS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=❌ Deploy failed & rolled back — ${{ inputs.application-id }} (${{ inputs.environment }}), image ${{ inputs.image }}"

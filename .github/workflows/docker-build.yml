@@ -1,0 +1,130 @@
+name: Docker build & push
+
+# Reusable "build once, promote everywhere" step for the docker-cloud-service-deploy flow.
+# Builds a service image, scans it, signs it, and pushes it to GHCR tagged by git SHA.
+# The SAME digest is what deploy-service.yml later rolls out to each environment — images
+# are never rebuilt per-env. Pairs with test.yml (QA gate) upstream and deploy-service.yml
+# downstream.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        type: string
+        required: true
+        description: >-
+          Image name under the org namespace, e.g. `majordom-cloud` →
+          ghcr.io/<owner>/majordom-cloud (owner is lower-cased for GHCR).
+      context:
+        type: string
+        default: "."
+      dockerfile:
+        type: string
+        default: "Dockerfile"
+        description: Path to the Dockerfile, relative to `context`.
+      build-args:
+        type: string
+        default: ""
+        description: Newline-separated build args passed to the build.
+      platforms:
+        type: string
+        default: "linux/amd64"
+      push:
+        type: boolean
+        default: true
+        description: >-
+          Push to GHCR. Set false on PR validation builds where you only want to prove the
+          image builds (scanning/signing are skipped when not pushing).
+      extra-tags:
+        type: string
+        default: ""
+        description: >-
+          Extra docker/metadata-action `tags:` lines appended to the default `sha-<short>` —
+          e.g. `type=raw,value=dev` to also move a floating env tag.
+      scan:
+        type: boolean
+        default: true
+        description: Fail the build on CRITICAL, fixable vulnerabilities (Trivy).
+      sign:
+        type: boolean
+        default: true
+        description: Keyless-sign the pushed digest with cosign (needs id-token write).
+    outputs:
+      image:
+        description: Digest-pinned image ref (ghcr.io/<owner>/<name>@sha256:…) — feed this to deploy-service.
+        value: ${{ jobs.build.outputs.image }}
+      tags:
+        description: Human tags applied to the push.
+        value: ${{ jobs.build.outputs.tags }}
+
+permissions:
+  contents: read
+  packages: write        # push to GHCR
+  id-token: write        # cosign keyless (OIDC)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lower-case the owner for GHCR
+        id: ns
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.ns.outputs.owner }}/${{ inputs.image-name }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            ${{ inputs.extra-tags }}
+
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ inputs.build-args }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Pin the digest
+        id: ref
+        run: echo "image=ghcr.io/${{ steps.ns.outputs.owner }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+      - name: Scan image (Trivy)
+        if: ${{ inputs.scan && inputs.push }}
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.ref.outputs.image }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Install cosign
+        if: ${{ inputs.sign && inputs.push }}
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the digest (keyless)
+        if: ${{ inputs.sign && inputs.push }}
+        run: cosign sign --yes "${{ steps.ref.outputs.image }}"
