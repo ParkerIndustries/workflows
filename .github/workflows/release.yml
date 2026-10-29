@@ -212,6 +212,8 @@ jobs:
         id: changelog
         env:
           DOCS_URL: ${{ inputs.docs-url }}
+          PACKAGE: ${{ inputs.pypi-package-name }}
+          VERSION: ${{ steps.bump.outputs.version }}
         run: |
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
           if [ -z "$LAST_TAG" ]; then
@@ -223,7 +225,8 @@ jobs:
             DIFF_BASE="$LAST_TAG"
           fi
 
-          COMMITS=$(git log --pretty=format:"- %s" ${RANGE})
+          # dependabot merges and chore commits (the version bump too) stay out of the changelog, as in STARK
+          COMMITS=$(git log --pretty=format:"- %s" ${RANGE} | grep -Ev '^- (Merge pull request #[0-9]+ from [^ ]+/dependabot/|chore(\([^)]*\))?!?:)' || true)
 
           # docs/**.md -> hosted-site links, matching STARK's release-notes style.
           # Only emitted when docs-url is provided (repos without published docs skip this).
@@ -246,6 +249,8 @@ jobs:
           EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
           echo "changelog<<${EOF}" >> $GITHUB_OUTPUT
           {
+            echo "PyPI: https://pypi.org/project/${PACKAGE}/${VERSION}/"
+            echo ""
             if [ -n "$NEW_DOCS" ]; then
               echo "## New Documentation"
               echo "$NEW_DOCS"
