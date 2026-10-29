@@ -190,14 +190,23 @@ jobs:
       - name: Bump patch version
         id: bump
         run: |
-          poetry version patch
+          # A version set by hand above the last release (a minor or major bump) is released as is; otherwise the
+          # patch goes up, numerically: 0.2.9 -> 0.2.10, never 0.3.0
           VERSION=$(poetry version --short)
+          LAST=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//')
+          if [ -n "$LAST" ] && [ "$VERSION" != "$LAST" ] && [ "$(printf '%s\n' "$LAST" "$VERSION" | sort -V | tail -1)" = "$VERSION" ]; then
+            echo "Releasing ${VERSION} as set (last release ${LAST})"
+          else
+            [ -n "$LAST" ] && poetry version "$LAST"  # never below the last release
+            poetry version patch
+            VERSION=$(poetry version --short)
+            git add pyproject.toml
+            git commit -m "chore: bump version to v${VERSION}"
+            git push origin "$DEV_BRANCH"
+          fi
           TAG="v${VERSION}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          git add pyproject.toml
-          git commit -m "chore: bump version to ${TAG}"
-          git push origin "$DEV_BRANCH"
 
       - name: Generate changelog
         id: changelog
