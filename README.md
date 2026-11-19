@@ -158,3 +158,33 @@ Dependabot-driven bumps (each bump then runs through their own CI before auto-me
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
+
+## docker-cloud-service-deploy flow (services → GHCR → Dokploy)
+
+Sibling to the python-build-package-pypi flow, for containerized services. Consuming repos
+hold thin stubs; all logic is here.
+
+```
+push/PR → test.yml (QA + services: postgres/redis via `services-compose`) → stable `check`
+        → docker-build.yml (build → Trivy → cosign → GHCR :sha-xxxx, digest-pinned)
+        → deploy-service.yml (Tailscale → Dokploy deploy → health-gate → rollback + Telegram)
+PR      → preview.yml / preview-teardown.yml (per-PR env, Cloudflare Access) [DRAFT]
+```
+
+### `docker-build.yml`
+Build-once-promote-everywhere. Builds `context/dockerfile`, tags `sha-<short>` (+ `extra-tags`),
+pushes to `ghcr.io/<owner>/<image-name>`, Trivy-scans (fail on fixable CRITICAL), cosign-signs
+(keyless). Outputs a **digest-pinned** `image` ref to hand to `deploy-service`.
+
+### `deploy-service.yml`
+Rolls one env via Dokploy over **Tailscale** (control-plane port stays private): triggers the
+deploy, **health-gates** the result, and **rolls back + reports to Telegram** on failure.
+Dokploy API paths are inputs (`deploy-endpoint`/`rollback-endpoint`) — verify against the live
+version. Needs `tailscale-oauth-*` + `dokploy-token` secrets.
+
+### `test.yml` — new `services-compose` input
+Point it at a compose file and the reusable brings its services up (`--wait`) before checks and
+tears them down after — the first-class way to give DB-backed repos a Postgres in CI.
+
+### `preview.yml` / `preview-teardown.yml` — DRAFT
+Per-PR ephemeral envs; finalize once Dokploy is live (or use Dokploy native PR previews).

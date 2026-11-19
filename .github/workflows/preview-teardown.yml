@@ -1,0 +1,44 @@
+name: Preview teardown (DRAFT)
+
+# DRAFT — finalize with Dokploy's real API. Destroys the per-PR preview env + its DNS when
+# the PR closes/merges. Pair with preview.yml. (If you use Dokploy's native PR previews,
+# it tears down on its own and this is unnecessary.)
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+      dokploy-url:
+        required: true
+        type: string
+      destroy-endpoint:
+        type: string
+        default: "/api/preview.destroy"
+        description: Dokploy destroy-preview endpoint — VERIFY against your version.
+    secrets:
+      tailscale-oauth-client-id: { required: true }
+      tailscale-oauth-secret: { required: true }
+      dokploy-token: { required: true }
+
+jobs:
+  teardown:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Join tailnet (ephemeral)
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.tailscale-oauth-client-id }}
+          oauth-secret: ${{ secrets.tailscale-oauth-secret }}
+          tags: tag:ci
+
+      - name: Destroy Dokploy preview app
+        env:
+          DOKPLOY_TOKEN: ${{ secrets.dokploy-token }}
+        run: |
+          set -euo pipefail
+          echo "Tearing down preview for ${{ inputs.service }} PR #${{ github.event.number }}"
+          curl -fsS -X POST "${{ inputs.dokploy-url }}${{ inputs.destroy-endpoint }}" \
+            -H "x-api-key: $DOKPLOY_TOKEN" -H "Content-Type: application/json" \
+            --data "{\"service\":\"${{ inputs.service }}\",\"pr\":${{ github.event.number }}}"

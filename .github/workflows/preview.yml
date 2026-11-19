@@ -1,0 +1,62 @@
+name: Preview deploy (DRAFT)
+
+# DRAFT — finalize once Dokploy is stood up on the UK box (needs its real preview API).
+# Per-PR ephemeral environment at  pr-<n>-<service>.<base-domain>, gated by Cloudflare Access.
+#
+# NOTE: Dokploy has a NATIVE PR-preview feature (enable per app via its Git integration),
+# which may cover this without a custom reusable. Use this CI-driven variant only when you
+# want the image built in Actions (scanned + signed by docker-build) and handed to Dokploy.
+# Endpoints are inputs so they can be verified against the live Dokploy version.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+        description: Service slug, e.g. `cloud` → pr-42-cloud.<base-domain>.
+      image:
+        required: true
+        type: string
+        description: PR image (digest-pinned) from docker-build.
+      dokploy-url:
+        required: true
+        type: string
+      base-domain:
+        required: true
+        type: string
+        description: e.g. preview.majordom.systems
+      upsert-endpoint:
+        type: string
+        default: "/api/preview.upsert"
+        description: Dokploy create/update-preview endpoint — VERIFY against your version.
+    secrets:
+      tailscale-oauth-client-id: { required: true }
+      tailscale-oauth-secret: { required: true }
+      dokploy-token: { required: true }
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: preview-${{ inputs.service }}-${{ github.event.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Join tailnet (ephemeral)
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.tailscale-oauth-client-id }}
+          oauth-secret: ${{ secrets.tailscale-oauth-secret }}
+          tags: tag:ci
+
+      - name: Upsert Dokploy preview app
+        env:
+          DOKPLOY_TOKEN: ${{ secrets.dokploy-token }}
+        run: |
+          set -euo pipefail
+          host="pr-${{ github.event.number }}-${{ inputs.service }}.${{ inputs.base-domain }}"
+          echo "Preview host: https://$host  (image ${{ inputs.image }})"
+          curl -fsS -X POST "${{ inputs.dokploy-url }}${{ inputs.upsert-endpoint }}" \
+            -H "x-api-key: $DOKPLOY_TOKEN" -H "Content-Type: application/json" \
+            --data "{\"service\":\"${{ inputs.service }}\",\"pr\":${{ github.event.number }},\"image\":\"${{ inputs.image }}\",\"host\":\"$host\"}"
+          echo "Apply a Cloudflare Access policy to *.${{ inputs.base-domain }} so only invited testers reach previews."

@@ -1,0 +1,39 @@
+name: GHCR cleanup
+
+# Keeps the GHCR registry from growing without bound — every push builds a new per-SHA image,
+# so old versions must be pruned or they leak storage. Callers schedule this (e.g. weekly).
+# Pairs with a host-side `docker image prune` (Ansible docker role / Dokploy cleanup) which
+# handles images pulled onto the tiny VPS; this handles the registry side.
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        required: true
+        type: string
+        description: GHCR package name (usually the image-name, e.g. majordom-cloud).
+      keep:
+        type: number
+        default: 10
+        description: Number of most-recent versions to keep; older ones are deleted.
+    secrets:
+      token:
+        required: false
+        description: >-
+          PAT with delete:packages, needed only for ORG-owned packages. For user/repo-owned
+          packages the default GITHUB_TOKEN suffices (omit this).
+
+permissions:
+  packages: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete old GHCR versions (keep newest ${{ inputs.keep }})
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ inputs.package }}
+          package-type: container
+          min-versions-to-keep: ${{ inputs.keep }}
+          token: ${{ secrets.token || github.token }}
