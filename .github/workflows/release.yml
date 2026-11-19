@@ -373,6 +373,12 @@ jobs:
           merge-multiple: true
           path: dist/
 
+      # The sign action installs its deps into the runner's default Python, which outgrew pydantic-core wheels (3.14)
+      - name: Set up Python for Sigstore
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: Sign distributions with Sigstore
         uses: sigstore/gh-action-sigstore-python@v3.0.1
         with:
